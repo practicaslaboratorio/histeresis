@@ -1,108 +1,84 @@
-/* 
-Lectura de DHT11 en D4
-Lectura de termistor en A0
-Control de celda Peltier y ventilador mediante relés (D5 y D6)
-Visualización de datos por Serial
-NO1 / NO2 : Active HIGH (HIGH enciende, LOW apaga)
-*/
-#include <TimerOne.h>
 #include <DHT.h>
+
 #define DHTPIN 4
 #define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+#define TERM_PIN A0
 #define RELAY_PELTIER 5
 #define RELAY_FAN 6
-DHT dht(DHTPIN, DHTTYPE);
-float Tamb = 0;      // Temperatura ambientalfloat Tsup = 0;      // Temperatura en la superficie de la celda
-int inicio = 0, estado = 0, fin = 1, eT = -1;
-float dT1 = 1.0, dT2 = 1.5;
-unsigned long tiempo_1 = 0, tiempo_2 = 0, tiempo_3 = 0, control_tiempos = 0;
-void setup() {
-Serial.begin(9600);
-dht.begin();
-pinMode(RELAY_PELTIER, OUTPUT);
-pinMode(RELAY_FAN, OUTPUT);
-digitalWrite(RELAY_PELTIER, LOW);  // Inicial apagado
-digitalWrite(RELAY_FAN, LOW);      // Inicial apagado
-Timer1.initialize(1000000);
-Timer1.attachInterrupt(intu);
-Serial.println("Sistema listo. Envíe comando: c <modo> <t1> <t2> <t3>");
-}
 
-void intu() {
-Serial.print(Tamb);
-Serial.print(",");
-Serial.println(Tsup);
-control_tiempos++;
-}
-// Control ON / OFF simple (Active HIGH)
-void controlTemperatura() {
-if (eT == -1) {
-digitalWrite(RELAY_PELTIER, HIGH);  // Encender
-digitalWrite(RELAY_FAN, HIGH);      // Encender
-eT = 1;
-} else {
-digitalWrite(RELAY_PELTIER, LOW);   // Apagar
-digitalWrite(RELAY_FAN, LOW);       // Apagar
-eT = -1;
-  }
-}
-float leerTermistor() {
-int val = analogRead(A0);
-float V = (val * 5.0) / 1023.0;
-return 1.7842 * V * V * V - 11.597 * V * V + 45.702 * V - 44.733;
+float Tamb = 0;   
+float Tsup = 0;   
+float consigna = 0; 
+float dT1 = 0;
+float dT2 = 0;
+
+bool peltierON = false;
+bool fanON = false; // control manual desde Processing
+
+unsigned long lastSerial = 0;
+
+void setup() {
+  Serial.begin(9600);
+  dht.begin();
+  
+  pinMode(RELAY_PELTIER, OUTPUT);
+  pinMode(RELAY_FAN, OUTPUT);
+  
+  digitalWrite(RELAY_PELTIER, LOW);
+  digitalWrite(RELAY_FAN, LOW);    
 }
 
 void loop() {
-Tamb = dht.readTemperature();
-Tsup = leerTermistor();
-switch (inicio) {
+  Tamb = dht.readTemperature();
+  Tsup = leerTermistor();
 
-case 0:
-digitalWrite(RELAY_PELTIER, LOW);
-digitalWrite(RELAY_FAN, LOW);
-estado = 0;
-break;
-case 1:
-estado = 1;
-break;
-case 2:
-if (control_tiempos < tiempo_1) {
-estado = 1;
-} else if (control_tiempos < tiempo_1 + tiempo_2) {
-controlTemperatura();
-estado = 2;
-} else if (control_tiempos < tiempo_1 + tiempo_2 + tiempo_3) {
-digitalWrite(RELAY_PELTIER, LOW);
-digitalWrite(RELAY_FAN, LOW);
-estado = 3;
-} else {
-fin = 0;
-inicio = 0;
-estado = 4;
-control_tiempos = 0;
-}
-break;
+  // Histéresis Peltier (solo si consigna >0)
+  if(consigna>0){
+    if (peltierON) {
+      if (Tsup <= consigna - dT2) peltierON = false;
+      else if (Tsup >= consigna + dT1) peltierON = true;
+    } else {
+      if (Tsup >= consigna + dT1) peltierON = true;
+    }
+  }
 
-default:
-inicio = 0;
-break;
-   }
+  digitalWrite(RELAY_PELTIER, peltierON ? HIGH : LOW);
+  digitalWrite(RELAY_FAN, fanON ? HIGH : LOW);
+
+  // Enviar datos cada 500 ms
+  if (millis() - lastSerial > 500) {
+    lastSerial = millis();
+    Serial.print(Tamb,2); Serial.print(",");
+    Serial.print(Tsup,2); Serial.print(",");
+    Serial.print(peltierON?"1":"0"); Serial.print(",");
+    Serial.println(fanON?"1":"0");
+  }
+
+  // Comandos desde Processing
+  if (Serial.available() > 0) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    if (cmd.startsWith("SET")) {
+      int idx1 = cmd.indexOf(',');
+      int idx2 = cmd.indexOf(',', idx1 + 1);
+      int idx3 = cmd.indexOf(',', idx2 + 1);
+      if (idx1>0 && idx2>0 && idx3>0){
+        consigna = cmd.substring(idx1+1, idx2).toFloat();
+        dT1 = cmd.substring(idx2+1, idx3).toFloat();
+        dT2 = cmd.substring(idx3+1).toFloat();
+        peltierON = true; // activar Peltier al iniciar ensayo
+      }
+    } else if (cmd.startsWith("FAN_ON")) fanON = true;
+    else if (cmd.startsWith("FAN_OFF")) fanON = false;
+  }
 }
 
-void serialEvent() {
-if (Serial.peek() == 'c') {
-Timer1.detachInterrupt();
-Serial.read();
-inicio = Serial.parseInt();
-tiempo_1 = Serial.parseInt();
-tiempo_2 = Serial.parseInt();
-tiempo_3 = Serial.parseInt();
-dT1 = Serial.parseFloat();
-dT2 = Serial.parseFloat();
-fin = 1;
-control_tiempos = 0;
-Timer1.attachInterrupt(intu);
+// Función termistor ajustada
+float leerTermistor() {
+  int val = analogRead(TERM_PIN);
+  float V = (val * 5.0) / 1023.0;
+  // Polinomio ajustado para valores razonables
+  return 0.3754*V*V*V*V - 2.1424*V*V*V + 2.8994*V*V + 23.355*V - 32.646;
 }
-while (Serial.available() > 0) Serial.read();
-}
-// Ejemplo comando serial: c 2 5 10 5 1.0 1.5
